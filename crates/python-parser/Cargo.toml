@@ -1,0 +1,17 @@
+[package]
+name = "python-parser"
+description = "Python code parser for extracting class and method definitions"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tree-sitter.workspace = true
+tree-sitter-python.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+walkdir.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

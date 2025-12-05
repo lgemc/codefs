@@ -1,0 +1,20 @@
+[package]
+name = "codefs-cli"
+description = "CLI for mounting Python code as a virtual filesystem"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "codefs"
+path = "src/main.rs"
+
+[dependencies]
+python-parser = { path = "../python-parser" }
+vfs-core = { path = "../vfs-core" }
+python-vfs = { path = "../python-vfs" }
+clap.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde_json.workspace = true
