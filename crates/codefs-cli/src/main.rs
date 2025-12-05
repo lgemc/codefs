@@ -5,8 +5,8 @@ use clap::{Parser, Subcommand};
 use python_parser::PythonParser;
 use python_vfs::{PythonFuseFs, PythonVfsBuilder};
 use std::path::PathBuf;
-use tracing::{info, Level};
-use tracing_subscriber::FmtSubscriber;
+use tracing::info;
+use vfs_core::logging;
 
 #[derive(Parser)]
 #[command(name = "codefs")]
@@ -47,6 +47,10 @@ enum Commands {
         /// Run in foreground (don't daemonize)
         #[arg(short, long)]
         foreground: bool,
+
+        /// Enable write support (changes to __source__.py files sync back to original files)
+        #[arg(short, long)]
+        writable: bool,
     },
 
     /// Parse a Python directory and print the structure
@@ -93,20 +97,10 @@ impl std::str::FromStr for OutputFormat {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Set up logging
-    let level = match cli.verbose {
-        0 => Level::WARN,
-        1 => Level::INFO,
-        2 => Level::DEBUG,
-        _ => Level::TRACE,
-    };
-
-    let subscriber = FmtSubscriber::builder()
-        .with_max_level(level)
-        .with_target(false)
-        .finish();
-    tracing::subscriber::set_global_default(subscriber)
-        .context("Failed to set up logging")?;
+    // Set up logging using centralized logger
+    // Priority: CODEFS_LOG env var > RUST_LOG env var > CLI verbosity
+    logging::init_from_verbosity(cli.verbose)
+        .map_err(|e| anyhow::anyhow!("Failed to set up logging: {}", e))?;
 
     match cli.command {
         Commands::Mount {
@@ -116,6 +110,7 @@ fn main() -> Result<()> {
             no_metadata,
             flat,
             foreground,
+            writable,
         } => {
             cmd_mount(
                 source,
@@ -124,6 +119,7 @@ fn main() -> Result<()> {
                 !no_metadata,
                 !flat,
                 foreground,
+                writable,
             )?;
         }
         Commands::Parse { source, format } => {
@@ -144,6 +140,7 @@ fn cmd_mount(
     include_metadata: bool,
     group_by_file: bool,
     foreground: bool,
+    writable: bool,
 ) -> Result<()> {
     info!("Parsing Python source directory: {}", source.display());
 
@@ -164,10 +161,26 @@ fn cmd_mount(
             .context("Failed to create mountpoint directory")?;
     }
 
-    let fs = PythonFuseFs::new(tree);
+    // Pass source root for reload support when writable
+    let source_root = if writable {
+        Some(source.canonicalize().context("Failed to canonicalize source path")?)
+    } else {
+        None
+    };
 
+    let fs = PythonFuseFs::with_options(tree, writable, source_root);
+
+    let mode = if writable { "writable" } else { "read-only" };
     if foreground {
-        println!("Mounting {} at {} (foreground mode)", source.display(), mountpoint.display());
+        println!(
+            "Mounting {} at {} ({}, foreground mode)",
+            source.display(),
+            mountpoint.display(),
+            mode
+        );
+        if writable {
+            println!("Write mode enabled - changes to method files will modify original source files!");
+        }
         println!("Press Ctrl+C to unmount");
         fs.mount_foreground(&mountpoint)
             .context("Failed to mount filesystem")?;

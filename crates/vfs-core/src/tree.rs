@@ -3,7 +3,7 @@
 use crate::error::VfsError;
 use crate::node::{FileContent, VfsNode};
 use std::path::{Component, Path};
-use tracing::trace;
+use tracing::{debug, error, info, trace, warn};
 
 /// A virtual filesystem tree.
 #[derive(Debug, Clone)]
@@ -198,6 +198,395 @@ impl VfsTree {
     pub fn read_to_string(&self, path: impl AsRef<Path>) -> Result<String, VfsError> {
         let bytes = self.read(path)?;
         String::from_utf8(bytes).map_err(|_| VfsError::InvalidPath("Invalid UTF-8".to_string()))
+    }
+
+    /// Write content to a file, optionally syncing to the original source file.
+    ///
+    /// This handles two cases:
+    /// 1. Full file write (source_path is set): writes entire content to source file
+    /// 2. Fragment write (source_fragment is set): replaces the fragment span in the source file
+    ///
+    /// Returns the updated source file path if a write occurred (for reload purposes).
+    pub fn write(
+        &mut self,
+        path: impl AsRef<Path>,
+        content: Vec<u8>,
+        sync_to_source: bool,
+    ) -> Result<Option<std::path::PathBuf>, VfsError> {
+        let vfs_path = path.as_ref();
+        info!(
+            path = %vfs_path.display(),
+            content_len = content.len(),
+            sync_to_source = sync_to_source,
+            "VFS write operation started"
+        );
+
+        let node = self.get_mut(vfs_path)?;
+        if !node.is_file() {
+            error!(path = %vfs_path.display(), "Write failed: not a file");
+            return Err(VfsError::NotAFile(vfs_path.display().to_string()));
+        }
+
+        debug!(
+            path = %vfs_path.display(),
+            has_source_fragment = node.source_fragment.is_some(),
+            has_source_path = node.source_path.is_some(),
+            "Node source info"
+        );
+
+        let mut modified_source: Option<std::path::PathBuf> = None;
+        let mut new_fragment_end: Option<usize> = None;
+
+        // If sync_to_source is enabled, try to write back
+        if sync_to_source {
+            // First check for source fragment (method/function fragment)
+            if let Some(fragment) = &node.source_fragment {
+                let source_path = fragment.source_path.clone();
+                let start = fragment.start_byte;
+                let end = fragment.end_byte;
+
+                info!(
+                    source_file = %source_path.display(),
+                    start_byte = start,
+                    end_byte = end,
+                    start_line = fragment.start_line,
+                    end_line = fragment.end_line,
+                    fragment_size = end - start,
+                    new_content_size = content.len(),
+                    "Syncing fragment write to source file"
+                );
+
+                // Read the original source file
+                debug!(source_file = %source_path.display(), "Reading original source file");
+                let original_content = std::fs::read(&source_path).map_err(|e| {
+                    error!(
+                        source_file = %source_path.display(),
+                        error = %e,
+                        "Failed to read source file"
+                    );
+                    VfsError::InvalidPath(format!("Failed to read source file: {}", e))
+                })?;
+
+                debug!(
+                    original_size = original_content.len(),
+                    "Original source file read successfully"
+                );
+
+                // Validate byte ranges
+                if start > original_content.len() || end > original_content.len() {
+                    error!(
+                        start_byte = start,
+                        end_byte = end,
+                        file_size = original_content.len(),
+                        "Fragment byte range exceeds file size"
+                    );
+                    return Err(VfsError::InvalidPath(format!(
+                        "Fragment byte range {}..{} exceeds file size {}",
+                        start, end, original_content.len()
+                    )));
+                }
+
+                // Build new file content by replacing the fragment span
+                let mut new_file_content = Vec::new();
+                new_file_content.extend_from_slice(&original_content[..start]);
+                new_file_content.extend_from_slice(&content);
+                new_file_content.extend_from_slice(&original_content[end..]);
+
+                debug!(
+                    before_fragment = start,
+                    new_content = content.len(),
+                    after_fragment = original_content.len() - end,
+                    total_new_size = new_file_content.len(),
+                    "Built new file content"
+                );
+
+                // Write back to the source file
+                info!(
+                    source_file = %source_path.display(),
+                    new_size = new_file_content.len(),
+                    "Writing updated content to source file"
+                );
+                std::fs::write(&source_path, &new_file_content).map_err(|e| {
+                    error!(
+                        source_file = %source_path.display(),
+                        error = %e,
+                        "Failed to write to source file"
+                    );
+                    VfsError::InvalidPath(format!("Failed to write to source: {}", e))
+                })?;
+
+                info!(
+                    source_file = %source_path.display(),
+                    "Source file updated successfully"
+                );
+                modified_source = Some(source_path.clone());
+
+                // Calculate new fragment end_byte to update after we're done with the borrow
+                // This is critical for subsequent writes to use the correct byte range
+                new_fragment_end = Some(start + content.len());
+                debug!(
+                    old_end_byte = end,
+                    new_end_byte = start + content.len(),
+                    "Will update fragment end_byte after source write"
+                );
+            }
+            // Fall back to full file source_path
+            else if let Some(source_path) = &node.source_path {
+                info!(
+                    source_file = %source_path.display(),
+                    content_size = content.len(),
+                    "Syncing full file write to source"
+                );
+                std::fs::write(source_path, &content).map_err(|e| {
+                    error!(
+                        source_file = %source_path.display(),
+                        error = %e,
+                        "Failed to write to source file"
+                    );
+                    VfsError::InvalidPath(format!("Failed to write to source: {}", e))
+                })?;
+                info!(
+                    source_file = %source_path.display(),
+                    "Source file updated successfully"
+                );
+                modified_source = Some(source_path.clone());
+            } else {
+                warn!(
+                    path = %vfs_path.display(),
+                    "sync_to_source enabled but node has no source_fragment or source_path"
+                );
+            }
+        } else {
+            debug!(path = %vfs_path.display(), "sync_to_source disabled, only updating in-memory content");
+        }
+
+        // Update in-memory content
+        debug!(path = %vfs_path.display(), content_len = content.len(), "Updating in-memory content");
+        node.set_content(FileContent::from_bytes(content));
+
+        // Update the fragment's end_byte if it changed
+        if let Some(new_end) = new_fragment_end {
+            if let Some(ref mut frag) = node.source_fragment {
+                debug!(
+                    old_end = frag.end_byte,
+                    new_end = new_end,
+                    "Updated fragment end_byte"
+                );
+                frag.end_byte = new_end;
+            }
+        }
+
+        info!(
+            path = %vfs_path.display(),
+            modified_source = ?modified_source,
+            "VFS write operation completed"
+        );
+        Ok(modified_source)
+    }
+
+    /// Truncate a file to a given size, optionally syncing to the original source file.
+    pub fn truncate(
+        &mut self,
+        path: impl AsRef<Path>,
+        size: u64,
+        sync_to_source: bool,
+    ) -> Result<Option<std::path::PathBuf>, VfsError> {
+        let node = self.get_mut(path.as_ref())?;
+        if !node.is_file() {
+            return Err(VfsError::NotAFile(path.as_ref().display().to_string()));
+        }
+
+        let current_content = node.get_content().unwrap_or_default();
+        let new_content = if size == 0 {
+            Vec::new()
+        } else if (size as usize) < current_content.len() {
+            current_content[..size as usize].to_vec()
+        } else {
+            let mut extended = current_content;
+            extended.resize(size as usize, 0);
+            extended
+        };
+
+        // Use the write method for consistency
+        self.write(path, new_content, sync_to_source)
+    }
+
+    /// Rename/move a node from one path to another.
+    ///
+    /// If the destination exists and has source tracking info (source_fragment or source_path),
+    /// the source content is updated with the new node's content, and the source tracking
+    /// info is preserved on the new node.
+    ///
+    /// Returns the modified source path if any source file was updated.
+    pub fn rename(
+        &mut self,
+        from_path: impl AsRef<Path>,
+        to_path: impl AsRef<Path>,
+        sync_to_source: bool,
+    ) -> Result<Option<std::path::PathBuf>, VfsError> {
+        let from = from_path.as_ref();
+        let to = to_path.as_ref();
+
+        info!(
+            from = %from.display(),
+            to = %to.display(),
+            sync_to_source = sync_to_source,
+            "VFS rename operation started"
+        );
+
+        // Get the source node's content first
+        let source_content = self.read(from)?;
+        debug!(
+            from = %from.display(),
+            content_len = source_content.len(),
+            "Read source content for rename"
+        );
+
+        // Check if destination exists and has source tracking info
+        let dest_source_info = if let Ok(dest_node) = self.get(to) {
+            let fragment = dest_node.source_fragment.clone();
+            let path = dest_node.source_path.clone();
+            debug!(
+                to = %to.display(),
+                has_source_fragment = fragment.is_some(),
+                has_source_path = path.is_some(),
+                "Destination exists with source tracking info"
+            );
+            Some((fragment, path))
+        } else {
+            debug!(to = %to.display(), "Destination does not exist");
+            None
+        };
+
+        // Remove the source node
+        let mut source_node = self.remove(from)?;
+        debug!(from = %from.display(), "Removed source node");
+
+        // Update the source node's name to match the destination
+        let to_components = Self::normalize_path(to);
+        if let Some(new_name) = to_components.last() {
+            source_node.name = new_name.clone();
+        }
+
+        // If destination had source tracking info, apply it to the source node
+        // and sync the content to the original source file
+        let mut modified_source: Option<std::path::PathBuf> = None;
+
+        if let Some((dest_fragment, dest_source_path)) = dest_source_info {
+            // Remove the existing destination node first
+            let _ = self.remove(to);
+
+            // Transfer source tracking info to the moved node
+            if let Some(fragment) = dest_fragment {
+                info!(
+                    source_file = %fragment.source_path.display(),
+                    start_byte = fragment.start_byte,
+                    end_byte = fragment.end_byte,
+                    "Transferring source fragment from destination to renamed node"
+                );
+                source_node.source_fragment = Some(fragment.clone());
+
+                // If sync is enabled, write the content to the source file
+                if sync_to_source {
+                    let source_path = fragment.source_path.clone();
+                    let start = fragment.start_byte;
+                    let end = fragment.end_byte;
+
+                    debug!(source_file = %source_path.display(), "Reading original source file");
+                    let original_content = std::fs::read(&source_path).map_err(|e| {
+                        error!(
+                            source_file = %source_path.display(),
+                            error = %e,
+                            "Failed to read source file"
+                        );
+                        VfsError::InvalidPath(format!("Failed to read source file: {}", e))
+                    })?;
+
+                    // Validate byte ranges
+                    if start > original_content.len() || end > original_content.len() {
+                        error!(
+                            start_byte = start,
+                            end_byte = end,
+                            file_size = original_content.len(),
+                            "Fragment byte range exceeds file size"
+                        );
+                        return Err(VfsError::InvalidPath(format!(
+                            "Fragment byte range {}..{} exceeds file size {}",
+                            start, end, original_content.len()
+                        )));
+                    }
+
+                    // Build new file content
+                    let mut new_file_content = Vec::new();
+                    new_file_content.extend_from_slice(&original_content[..start]);
+                    new_file_content.extend_from_slice(&source_content);
+                    new_file_content.extend_from_slice(&original_content[end..]);
+
+                    info!(
+                        source_file = %source_path.display(),
+                        new_size = new_file_content.len(),
+                        "Writing updated content to source file (via rename)"
+                    );
+                    std::fs::write(&source_path, &new_file_content).map_err(|e| {
+                        error!(
+                            source_file = %source_path.display(),
+                            error = %e,
+                            "Failed to write to source file"
+                        );
+                        VfsError::InvalidPath(format!("Failed to write to source: {}", e))
+                    })?;
+
+                    info!(source_file = %source_path.display(), "Source file updated via rename");
+                    modified_source = Some(source_path);
+                }
+            } else if let Some(src_path) = dest_source_path {
+                info!(
+                    source_file = %src_path.display(),
+                    "Transferring source path from destination to renamed node"
+                );
+                source_node.source_path = Some(src_path.clone());
+
+                if sync_to_source {
+                    std::fs::write(&src_path, &source_content).map_err(|e| {
+                        error!(
+                            source_file = %src_path.display(),
+                            error = %e,
+                            "Failed to write to source file"
+                        );
+                        VfsError::InvalidPath(format!("Failed to write to source: {}", e))
+                    })?;
+                    info!(source_file = %src_path.display(), "Source file updated via rename");
+                    modified_source = Some(src_path);
+                }
+            }
+        } else {
+            // Destination didn't exist, just remove it in case (shouldn't happen)
+            let _ = self.remove(to);
+        }
+
+        // Create parent directories for destination if needed
+        let to_parent: std::path::PathBuf = to_components[..to_components.len().saturating_sub(1)]
+            .iter()
+            .collect();
+        if !to_parent.as_os_str().is_empty() {
+            self.mkdir_p(&to_parent)?;
+        }
+
+        // Add the node at the new location
+        let mut current = &mut self.root;
+        for component in &to_components[..to_components.len().saturating_sub(1)] {
+            current = current.get_child_mut(component).unwrap();
+        }
+        current.add_child(source_node).map_err(|e| VfsError::InvalidPath(e.to_string()))?;
+
+        info!(
+            from = %from.display(),
+            to = %to.display(),
+            modified_source = ?modified_source,
+            "VFS rename operation completed"
+        );
+
+        Ok(modified_source)
     }
 
     /// Walk all nodes in the tree.

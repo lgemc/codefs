@@ -1,10 +1,10 @@
 //! Builder for constructing the Python VFS tree.
 
 use crate::error::PythonVfsError;
-use python_parser::{ClassDef, FunctionDef, MethodDef, ParsedDirectory, PythonParser};
+use python_parser::{ClassDef, FunctionDef, MethodDef, ParsedDirectory, PythonParser, Span};
 use std::path::Path;
 use tracing::{debug, info};
-use vfs_core::{FileContent, VfsTree};
+use vfs_core::{FileContent, SourceFragment, VfsTree};
 
 /// Builder for creating a VFS tree from Python source code.
 pub struct PythonVfsBuilder {
@@ -99,6 +99,10 @@ impl PythonVfsBuilder {
             let module_dir = rel_path.with_extension("");
             tree.mkdir_p(&module_dir)?;
 
+            // Get absolute path to original source file
+            // parsed_file.path is already the full path from the parser
+            let original_path = parsed_file.path.canonicalize().unwrap_or_else(|_| parsed_file.path.clone());
+
             // Add module docstring if present
             if self.include_metadata {
                 if let Some(docstring) = &parsed_file.module.docstring {
@@ -106,19 +110,31 @@ impl PythonVfsBuilder {
                     tree.create_file_from_string(&info_path, docstring)?;
                 }
 
-                // Add full module source
-                let source_path = module_dir.join("__source__.py");
-                tree.create_file_from_string(&source_path, &parsed_file.module.source)?;
+                // Add full module source with source_path for write-back support
+                let vfs_source_path = module_dir.join("__source__.py");
+                tree.create_file(
+                    &vfs_source_path,
+                    FileContent::from_string(&parsed_file.module.source),
+                )?;
+                // Set the source path for write-back
+                if let Ok(node) = tree.get_mut(&vfs_source_path) {
+                    node.set_source_path(&original_path);
+                }
             }
 
-            // Add top-level functions
+            // Add top-level functions with source fragment tracking
             if self.include_functions {
-                self.add_functions(tree, &module_dir, &parsed_file.module.functions)?;
+                self.add_functions(
+                    tree,
+                    &module_dir,
+                    &parsed_file.module.functions,
+                    Some(&original_path),
+                )?;
             }
 
-            // Add classes
+            // Add classes with source fragment tracking
             for class in &parsed_file.module.classes {
-                self.add_class(tree, &module_dir, class)?;
+                self.add_class(tree, &module_dir, class, Some(&original_path))?;
             }
         }
 
@@ -138,18 +154,36 @@ impl PythonVfsBuilder {
             tree.mkdir_p(functions_dir)?;
 
             for (_, parsed_file) in &parsed.files {
-                self.add_functions(tree, functions_dir, &parsed_file.module.functions)?;
+                let original_path = parsed_file.path.canonicalize().unwrap_or_else(|_| parsed_file.path.clone());
+                self.add_functions(
+                    tree,
+                    functions_dir,
+                    &parsed_file.module.functions,
+                    Some(&original_path),
+                )?;
             }
         }
 
         // Add all classes at the top level
         for (_, parsed_file) in &parsed.files {
+            let original_path = parsed_file.path.canonicalize().unwrap_or_else(|_| parsed_file.path.clone());
             for class in &parsed_file.module.classes {
-                self.add_class(tree, Path::new(""), class)?;
+                self.add_class(tree, Path::new(""), class, Some(&original_path))?;
             }
         }
 
         Ok(())
+    }
+
+    /// Helper to create a SourceFragment from a Span
+    fn span_to_fragment(source_file: &Path, span: &Span) -> SourceFragment {
+        SourceFragment::new(
+            source_file,
+            span.start,
+            span.end,
+            span.start_line,
+            span.end_line,
+        )
     }
 
     fn add_functions(
@@ -157,6 +191,7 @@ impl PythonVfsBuilder {
         tree: &mut VfsTree,
         base_path: &Path,
         functions: &[FunctionDef],
+        source_file: Option<&Path>,
     ) -> Result<(), PythonVfsError> {
         if functions.is_empty() {
             return Ok(());
@@ -167,7 +202,14 @@ impl PythonVfsBuilder {
 
         for func in functions {
             let func_path = functions_dir.join(format!("{}.py", func.name));
-            tree.create_file(func_path, FileContent::from_string(&func.source))?;
+            tree.create_file(&func_path, FileContent::from_string(&func.source))?;
+
+            // Set source fragment for write-back support
+            if let Some(src_file) = source_file {
+                if let Ok(node) = tree.get_mut(&func_path) {
+                    node.set_source_fragment(Self::span_to_fragment(src_file, &func.span));
+                }
+            }
 
             if self.include_metadata {
                 if let Some(docstring) = &func.docstring {
@@ -185,6 +227,7 @@ impl PythonVfsBuilder {
         tree: &mut VfsTree,
         base_path: &Path,
         class: &ClassDef,
+        source_file: Option<&Path>,
     ) -> Result<(), PythonVfsError> {
         let class_dir = base_path.join(&class.name);
         debug!("Adding class: {} at {:?}", class.name, class_dir);
@@ -196,20 +239,27 @@ impl PythonVfsBuilder {
             let info_path = class_dir.join("__class__.txt");
             tree.create_file_from_string(&info_path, info)?;
 
-            // Add full class source
+            // Add full class source with fragment tracking
             let source_path = class_dir.join("__source__.py");
             tree.create_file_from_string(&source_path, &class.source)?;
+
+            // Set source fragment for class __source__.py
+            if let Some(src_file) = source_file {
+                if let Ok(node) = tree.get_mut(&source_path) {
+                    node.set_source_fragment(Self::span_to_fragment(src_file, &class.span));
+                }
+            }
         }
 
-        // Add methods
+        // Add methods with source fragment tracking
         for method in &class.methods {
-            self.add_method(tree, &class_dir, method)?;
+            self.add_method(tree, &class_dir, method, source_file)?;
         }
 
         // Add nested classes
         if self.include_nested_classes {
             for nested in &class.nested_classes {
-                self.add_class(tree, &class_dir, nested)?;
+                self.add_class(tree, &class_dir, nested, source_file)?;
             }
         }
 
@@ -221,9 +271,17 @@ impl PythonVfsBuilder {
         tree: &mut VfsTree,
         class_dir: &Path,
         method: &MethodDef,
+        source_file: Option<&Path>,
     ) -> Result<(), PythonVfsError> {
         let method_path = class_dir.join(format!("{}.py", method.name));
-        tree.create_file(method_path, FileContent::from_string(&method.source))?;
+        tree.create_file(&method_path, FileContent::from_string(&method.source))?;
+
+        // Set source fragment for write-back support
+        if let Some(src_file) = source_file {
+            if let Ok(node) = tree.get_mut(&method_path) {
+                node.set_source_fragment(Self::span_to_fragment(src_file, &method.span));
+            }
+        }
 
         if self.include_metadata {
             if let Some(docstring) = &method.docstring {

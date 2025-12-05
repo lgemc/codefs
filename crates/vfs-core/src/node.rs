@@ -2,7 +2,43 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::SystemTime;
+
+/// Represents a fragment of a source file (e.g., a method or function).
+/// Used for write-back support where editing a fragment updates the original file.
+#[derive(Debug, Clone)]
+pub struct SourceFragment {
+    /// Path to the original source file.
+    pub source_path: PathBuf,
+    /// Start byte offset in the source file (inclusive).
+    pub start_byte: usize,
+    /// End byte offset in the source file (exclusive).
+    pub end_byte: usize,
+    /// Start line number (1-indexed).
+    pub start_line: usize,
+    /// End line number (1-indexed).
+    pub end_line: usize,
+}
+
+impl SourceFragment {
+    /// Create a new source fragment.
+    pub fn new(
+        source_path: impl Into<PathBuf>,
+        start_byte: usize,
+        end_byte: usize,
+        start_line: usize,
+        end_line: usize,
+    ) -> Self {
+        Self {
+            source_path: source_path.into(),
+            start_byte,
+            end_byte,
+            start_line,
+            end_line,
+        }
+    }
+}
 
 /// The kind of a filesystem node.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -97,6 +133,10 @@ pub struct VfsNode {
     pub modified: SystemTime,
     /// Custom metadata.
     pub metadata: HashMap<String, String>,
+    /// Original source file path (for syncing full file writes back to disk).
+    pub source_path: Option<PathBuf>,
+    /// Source fragment info (for syncing fragment writes back to the original file).
+    pub source_fragment: Option<SourceFragment>,
 }
 
 impl VfsNode {
@@ -111,6 +151,8 @@ impl VfsNode {
             created: now,
             modified: now,
             metadata: HashMap::new(),
+            source_path: None,
+            source_fragment: None,
         }
     }
 
@@ -125,6 +167,48 @@ impl VfsNode {
             created: now,
             modified: now,
             metadata: HashMap::new(),
+            source_path: None,
+            source_fragment: None,
+        }
+    }
+
+    /// Create a new file node with content and a source path for write-back.
+    pub fn file_with_source(
+        name: impl Into<String>,
+        content: FileContent,
+        source_path: impl Into<PathBuf>,
+    ) -> Self {
+        let now = SystemTime::now();
+        Self {
+            name: name.into(),
+            kind: NodeKind::File,
+            content: Some(content),
+            children: HashMap::new(),
+            created: now,
+            modified: now,
+            metadata: HashMap::new(),
+            source_path: Some(source_path.into()),
+            source_fragment: None,
+        }
+    }
+
+    /// Create a new file node with content and a source fragment for fragment write-back.
+    pub fn file_with_fragment(
+        name: impl Into<String>,
+        content: FileContent,
+        fragment: SourceFragment,
+    ) -> Self {
+        let now = SystemTime::now();
+        Self {
+            name: name.into(),
+            kind: NodeKind::File,
+            content: Some(content),
+            children: HashMap::new(),
+            created: now,
+            modified: now,
+            metadata: HashMap::new(),
+            source_path: None,
+            source_fragment: Some(fragment),
         }
     }
 
@@ -146,6 +230,8 @@ impl VfsNode {
             created: now,
             modified: now,
             metadata: HashMap::new(),
+            source_path: None,
+            source_fragment: None,
         }
     }
 
@@ -202,5 +288,31 @@ impl VfsNode {
     /// Get metadata.
     pub fn get_metadata(&self, key: &str) -> Option<&String> {
         self.metadata.get(key)
+    }
+
+    /// Set the file content.
+    pub fn set_content(&mut self, content: FileContent) {
+        self.content = Some(content);
+        self.modified = SystemTime::now();
+    }
+
+    /// Set the source path for write-back support.
+    pub fn set_source_path(&mut self, path: impl Into<std::path::PathBuf>) {
+        self.source_path = Some(path.into());
+    }
+
+    /// Get the source path.
+    pub fn get_source_path(&self) -> Option<&std::path::Path> {
+        self.source_path.as_deref()
+    }
+
+    /// Set the source fragment for fragment write-back support.
+    pub fn set_source_fragment(&mut self, fragment: SourceFragment) {
+        self.source_fragment = Some(fragment);
+    }
+
+    /// Get the source fragment.
+    pub fn get_source_fragment(&self) -> Option<&SourceFragment> {
+        self.source_fragment.as_ref()
     }
 }

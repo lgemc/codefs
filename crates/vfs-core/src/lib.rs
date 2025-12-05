@@ -4,14 +4,15 @@
 //! to organize and expose data through a filesystem interface.
 
 mod error;
+pub mod logging;
 mod node;
 mod tree;
 
 pub use error::VfsError;
-pub use node::{FileContent, NodeKind, VfsNode};
+pub use node::{FileContent, NodeKind, SourceFragment, VfsNode};
 pub use tree::VfsTree;
 
 /// Re-export for convenience.
 pub mod prelude {
-    pub use crate::{FileContent, NodeKind, VfsError, VfsNode, VfsTree};
+    pub use crate::{FileContent, NodeKind, SourceFragment, VfsError, VfsNode, VfsTree};
 }
