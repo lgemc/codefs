@@ -166,30 +166,9 @@ impl PythonFuseFs {
         // Update the VFS tree
         let mut tree = self.tree.write().unwrap();
 
-        // Update the module's __source__.py
-        let source_vfs_path = module_dir.join("__source__.py");
-        if let Ok(node) = tree.get_mut(&source_vfs_path) {
-            node.set_content(FileContent::from_string(&module.source));
-            // Keep the existing source_path
-        }
-
         // Update each class and its methods
         for class in &module.classes {
             let class_dir = module_dir.join(&class.name);
-
-            // Update class __source__.py
-            let class_source_path = class_dir.join("__source__.py");
-            if let Ok(node) = tree.get_mut(&class_source_path) {
-                node.set_content(FileContent::from_string(&class.source));
-                // Update the span
-                node.set_source_fragment(SourceFragment::new(
-                    source_path,
-                    class.span.start,
-                    class.span.end,
-                    class.span.start_line,
-                    class.span.end_line,
-                ));
-            }
 
             // Update each method
             for method in &class.methods {

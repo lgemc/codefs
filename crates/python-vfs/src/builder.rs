@@ -109,17 +109,6 @@ impl PythonVfsBuilder {
                     let info_path = module_dir.join("__module__.txt");
                     tree.create_file_from_string(&info_path, docstring)?;
                 }
-
-                // Add full module source with source_path for write-back support
-                let vfs_source_path = module_dir.join("__source__.py");
-                tree.create_file(
-                    &vfs_source_path,
-                    FileContent::from_string(&parsed_file.module.source),
-                )?;
-                // Set the source path for write-back
-                if let Ok(node) = tree.get_mut(&vfs_source_path) {
-                    node.set_source_path(&original_path);
-                }
             }
 
             // Add top-level functions with source fragment tracking
@@ -238,17 +227,6 @@ impl PythonVfsBuilder {
             let info = self.build_class_info(class);
             let info_path = class_dir.join("__class__.txt");
             tree.create_file_from_string(&info_path, info)?;
-
-            // Add full class source with fragment tracking
-            let source_path = class_dir.join("__source__.py");
-            tree.create_file_from_string(&source_path, &class.source)?;
-
-            // Set source fragment for class __source__.py
-            if let Some(src_file) = source_file {
-                if let Ok(node) = tree.get_mut(&source_path) {
-                    node.set_source_fragment(Self::span_to_fragment(src_file, &class.span));
-                }
-            }
         }
 
         // Add methods with source fragment tracking
@@ -367,7 +345,6 @@ class Calculator:
         assert!(tree.exists("calculator/Calculator/add.py"));
         assert!(tree.exists("calculator/Calculator/subtract.py"));
         assert!(tree.exists("calculator/Calculator/__class__.txt"));
-        assert!(tree.exists("calculator/Calculator/__source__.py"));
 
         // Check content
         let add_content = tree.read_to_string("calculator/Calculator/add.py").unwrap();

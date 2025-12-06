@@ -48,7 +48,7 @@ enum Commands {
         #[arg(short, long)]
         foreground: bool,
 
-        /// Enable write support (changes to __source__.py files sync back to original files)
+        /// Enable write support (changes to method/function files sync back to original files)
         #[arg(short, long)]
         writable: bool,
     },
